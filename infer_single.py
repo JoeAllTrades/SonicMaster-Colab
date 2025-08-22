@@ -16,7 +16,7 @@ from model import TangoFlux
 
 
 def parse_args():
-    p = argparse.ArgumentParser("Single-sample inference for SonicMaster (TangoFlux).")
+    p = argparse.ArgumentParser("Single-sample inference for SonicMaster")
     p.add_argument("--ckpt", type=str, required=True,
                    help="Path to model.safetensors (or directory containing it).")
     p.add_argument("--input", type=str, required=True,
