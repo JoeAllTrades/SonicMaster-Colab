@@ -2,6 +2,7 @@ import os
 import sys
 import yaml
 import torch
+import random
 import torchaudio
 import soundfile as sf
 import numpy as np
@@ -17,7 +18,6 @@ from model import TangoFlux
 SPACE_ROOT = Path(__file__).parent.resolve()
 sys.path.append(SPACE_ROOT.as_posix())
 CONFIG_PATH = SPACE_ROOT / "configs" / "tangoflux_config.yaml"
-WEIGHTS_DIR = SPACE_ROOT / "weights"
 
 # Global model state
 MODEL = None
@@ -29,27 +29,34 @@ def load_models(hf_token=None):
     global MODEL, VAE
     
     if MODEL is not None and VAE is not None:
-        return "Models already loaded."
+        return "✅ Models already loaded."
 
     print("⏳ Loading configuration...")
     with open(CONFIG_PATH, "r") as f:
         config = yaml.safe_load(f)
 
-    print("⏳ Loading SonicMaster weights...")
-    # Ensure weights exist (downloaded via snapshot in Colab)
-    # Checks standard HF cache or local weights folder
-    model_path = SPACE_ROOT / "SonicMaster" / "model.safetensors" # check subdir
-    if not model_path.exists():
-        # Fallback to current dir or weights dir
-        model_path = SPACE_ROOT / "model.safetensors"
+    print("⏳ Searching for SonicMaster weights...")
+    # Smart search for weights
+    possible_paths = [
+        SPACE_ROOT / "model.safetensors",
+        SPACE_ROOT / "SonicMaster" / "model.safetensors",
+        SPACE_ROOT / "weights" / "model.safetensors"
+    ]
     
-    if not model_path.exists():
-         # Last resort: try standard HF download location logic or let user know
-         # For Colab usage, we assume snapshot_download put it in root or we download it now
+    model_path = None
+    for p in possible_paths:
+        if p.exists():
+            model_path = p
+            break
+            
+    if not model_path:
+         # Fallback: Download from HF if missing
+         print("⬇️ Weights not found locally. Downloading...")
          from huggingface_hub import hf_hub_download
          model_path = hf_hub_download(repo_id="amaai-lab/SonicMaster", filename="model.safetensors")
 
     # Load TangoFlux
+    print(f"⏳ Loading Main Model from {model_path}...")
     model = TangoFlux(config=config["model"])
     weights = load_file(str(model_path))
     model.load_state_dict(weights, strict=False)
@@ -71,9 +78,9 @@ def load_models(hf_token=None):
         vae.eval()
         VAE = vae
     except Exception as e:
-        return f"Error loading VAE. Check HF Token! {e}"
+        return f"❌ Error loading VAE. Check HF Token! Error: {e}"
 
-    return "✅ Models loaded successfully!"
+    return "✅ Models loaded successfully! Ready to process."
 
 def process_audio(
     input_audio, 
@@ -85,18 +92,24 @@ def process_audio(
     overlap_duration=10
 ):
     if MODEL is None or VAE is None:
-        raise gr.Error("Models not loaded! Please enter HF Token and load models first.")
+        raise gr.Error("⚠️ Models not loaded! Please enter HF Token and click 'Load Model' first.")
 
     if not input_audio:
-        raise gr.Error("Please upload audio.")
+        raise gr.Error("⚠️ Please upload an audio file.")
 
-    # Prepare inputs
+    # --- Seed Logic ---
+    if seed == -1:
+        seed = random.randint(0, 2**32 - 1)
+    print(f"🎲 Using Seed: {seed}")
     torch.manual_seed(seed)
+    
+    # Prepare Prompt
     prompt = prompt if prompt.strip() else "Master this track"
     
     # Load Audio
     sr, audio_data = input_audio
-    # Convert to torch tensor [C, T]
+    
+    # Convert to float32 [-1, 1]
     if audio_data.dtype == np.int16:
         audio_data = audio_data / 32768.0
     elif audio_data.dtype == np.int32:
@@ -134,7 +147,6 @@ def process_audio(
             audio_tensor = torch.nn.functional.pad(audio_tensor, (0, pad_len))
         
         chunks = [audio_tensor]
-        stride = chunk_size
     else:
         # Full Song Mode: Split with overlap
         chunks = []
@@ -150,9 +162,9 @@ def process_audio(
             start += stride
 
     # Processing Loop
-    print(f"Processing {len(chunks)} chunks...")
+    print(f"🔄 Processing {len(chunks)} chunk(s)...")
     
-    # Encode all chunks first (Batched)
+    # Encode all chunks first (Batched VAE)
     degraded_latents_list = []
     batch_size_vae = 4 
     
@@ -224,37 +236,59 @@ def process_audio(
     output_path = SPACE_ROOT / "output.flac"
     sf.write(output_path, final_audio.numpy().T, target_fs)
     
-    return output_path.as_posix()
+    # Return path and the seed used (for info)
+    return output_path.as_posix(), f"Done! Seed used: {seed}"
 
 
 # --- UI Construction ---
-with gr.Blocks(title="SonicMaster Colab", theme=gr.themes.Soft()) as app:
+# Custom CSS to make it look cleaner
+css = """
+.container { max-width: 800px; margin: auto; }
+"""
+
+with gr.Blocks(title="SonicMaster Colab", theme=gr.themes.Soft(), css=css) as app:
     gr.Markdown("# 🎛️ SonicMaster: AI Music Restoration")
     
-    with gr.Row():
-        with gr.Column(variant="panel"):
-            gr.Markdown("### 1. Setup")
-            hf_token_inp = gr.Textbox(label="Hugging Face Token (Required)", type="password", placeholder="hf_...")
-            load_btn = gr.Button("🔌 Load Model", variant="primary")
-            load_status = gr.Textbox(label="Status", interactive=False, value="Waiting to load...")
-            
-        with gr.Column(variant="panel"):
-            gr.Markdown("### 2. Input")
-            input_audio = gr.Audio(label="Source Audio", type="numpy")
-            prompt = gr.Textbox(label="Prompt", value="Master this track, remove reverb, high fidelity", lines=2)
-            
-            with gr.Accordion("⚙️ Advanced Settings", open=True):
-                full_song_chk = gr.Checkbox(label="Full Song Mode (Stitch Chunks)", value=True)
-                steps = gr.Slider(10, 100, value=25, step=1, label="Inference Steps")
-                cfg = gr.Slider(1, 15, value=7.0, step=0.5, label="Guidance Scale")
-                seed = gr.Number(label="Seed", value=42)
-            
-            run_btn = gr.Button("🚀 Process Audio", variant="primary", interactive=False)
+    # --- SECTION 1: INITIALIZATION ---
+    with gr.Group():
+        gr.Markdown("### 1. Initialization")
+        # Auto-fill token from env var if available
+        default_token = os.getenv("HF_TOKEN") or ""
+        hf_token_inp = gr.Textbox(
+            label="Hugging Face Token", 
+            value=default_token, 
+            type="password", 
+            placeholder="hf_..."
+        )
+        load_btn = gr.Button("🔌 Load Model", variant="primary")
+        load_status = gr.Textbox(label="Status", interactive=False, value="Waiting...")
 
-    with gr.Row():
-         output_audio = gr.Audio(label="Restored Audio", type="filepath")
+    # --- SECTION 2: INPUT & SETTINGS ---
+    # Using a single column flow
+    gr.Markdown("### 2. Audio & Settings")
+    
+    input_audio = gr.Audio(label="Source Audio", type="numpy")
+    prompt = gr.Textbox(
+        label="Prompt", 
+        value="Master this track, remove reverb, high fidelity", 
+        placeholder="Describe how you want to improve the audio..."
+    )
+    
+    with gr.Accordion("⚙️ Advanced Settings", open=True):
+        full_song_chk = gr.Checkbox(label="Full Song Mode (Stitch Chunks)", value=True)
+        steps = gr.Slider(10, 100, value=25, step=1, label="Inference Steps (Quality)")
+        cfg = gr.Slider(1, 15, value=7.0, step=0.5, label="Guidance Scale (Prompt Strength)")
+        seed = gr.Number(label="Seed (-1 = Random)", value=-1, precision=0)
+    
+    # --- SECTION 3: ACTION ---
+    run_btn = gr.Button("🚀 Process Audio", variant="primary", interactive=False, size="lg")
 
-    # Events
+    # --- SECTION 4: OUTPUT ---
+    gr.Markdown("### 3. Result")
+    output_audio = gr.Audio(label="Restored Audio", type="filepath")
+    result_info = gr.Textbox(label="Processing Info", interactive=False)
+
+    # --- EVENTS ---
     def unlock_ui(status):
         if "successfully" in status:
             return gr.update(interactive=True)
@@ -267,7 +301,7 @@ with gr.Blocks(title="SonicMaster Colab", theme=gr.themes.Soft()) as app:
     run_btn.click(
         process_audio,
         inputs=[input_audio, prompt, steps, cfg, seed, full_song_chk],
-        outputs=[output_audio]
+        outputs=[output_audio, result_info]
     )
 
 if __name__ == "__main__":
