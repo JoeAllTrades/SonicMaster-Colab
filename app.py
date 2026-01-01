@@ -29,11 +29,10 @@ def load_models(hf_token=None):
     if MODEL is not None and VAE is not None:
         return "✅ Models already loaded."
 
-    print("⏳ Loading configuration...")
     with open(CONFIG_PATH, "r") as f:
         config = yaml.safe_load(f)
 
-    print("⏳ Searching for SonicMaster weights...")
+    # Weights resolution
     possible_paths = [
         SPACE_ROOT / "model.safetensors",
         SPACE_ROOT / "SonicMaster" / "model.safetensors",
@@ -42,11 +41,10 @@ def load_models(hf_token=None):
     model_path = next((p for p in possible_paths if p.exists()), None)
             
     if not model_path:
-         print("⬇️ Weights not found locally. Downloading...")
          from huggingface_hub import hf_hub_download
          model_path = hf_hub_download(repo_id="amaai-lab/SonicMaster", filename="model.safetensors")
 
-    print(f"⏳ Loading Main Model from {model_path}...")
+    # Load TangoFlux (MM-DiT + DiT)
     model = TangoFlux(config=config["model"])
     weights = load_file(str(model_path))
     model.load_state_dict(weights, strict=False)
@@ -56,7 +54,7 @@ def load_models(hf_token=None):
         param.requires_grad = False
     MODEL = model
 
-    print("⏳ Loading VAE...")
+    # Load Stable Audio Open VAE (required by paper)
     try:
         vae = AutoencoderOobleck.from_pretrained(
             "stabilityai/stable-audio-open-1.0", 
@@ -66,207 +64,167 @@ def load_models(hf_token=None):
         vae.eval()
         VAE = vae
     except Exception as e:
-        return f"❌ Error loading VAE: {e}"
+        return f"❌ VAE Load Error: {e}"
 
-    return "✅ Models loaded successfully!"
+    return "✅ SonicMaster loaded successfully!"
 
 def match_target_amplitude(sound, target_sound, epsilon=1e-4):
     def rms(x): return np.sqrt(np.mean(x**2))
-    valid_mask = ~np.isnan(sound) & ~np.isinf(sound)
-    sound = np.where(valid_mask, sound, 0)
     source_rms = rms(sound)
     target_rms = rms(target_sound)
     if source_rms < epsilon: return sound
     gain = target_rms / (source_rms + epsilon)
     return sound * min(gain, 5.0)
 
-def process_audio(
-    input_audio, 
-    prompt, 
-    steps, 
-    guidance_scale, 
-    seed, 
-    solver, # <-- New Argument
-    full_song_mode, 
-    normalize_output, 
-    overlap_duration=10
-):
+def process_audio(input_audio, prompt, steps, cfg, seed, solver, ensemble, normalize):
     if MODEL is None or VAE is None:
-        raise gr.Error("⚠️ Models not loaded!")
-    if not input_audio:
-        raise gr.Error("⚠️ Please upload audio.")
-
-    # --- Strict Seeding ---
-    if seed == -1: seed = random.randint(0, 2**32 - 1)
-    print(f"🎲 Seed: {seed} | Solver: {solver}")
+        raise gr.Error("Please load the model first!")
     
+    # Seeding
+    if seed == -1: seed = random.randint(0, 2**32 - 1)
     torch.manual_seed(seed)
     random.seed(seed)
-    if torch.cuda.is_available():
-        torch.cuda.manual_seed_all(seed)
     
-    prompt = prompt if prompt.strip() else "Master this track"
     sr, audio_data = input_audio
+    target_fs = 44100
     
-    # Normalize input
+    # Prepare Audio Tensor [C, T]
     if audio_data.dtype == np.int16: audio_data = audio_data / 32768.0
     elif audio_data.dtype == np.int32: audio_data = audio_data / 2147483648.0
     audio_tensor = torch.from_numpy(audio_data).float()
-    original_audio_numpy = audio_tensor.numpy().flatten()
+    orig_np = audio_tensor.numpy().flatten()
 
-    # Stereo fix
     if audio_tensor.ndim == 1: audio_tensor = audio_tensor.unsqueeze(0).repeat(2, 1)
-    elif audio_tensor.ndim == 2:
-        audio_tensor = audio_tensor.t()
-        if audio_tensor.shape[0] == 1: audio_tensor = audio_tensor.repeat(2, 1)
+    elif audio_tensor.ndim == 2: audio_tensor = audio_tensor.t()
     
-    # Resample
-    target_fs = 44100
     if sr != target_fs:
         resampler = torchaudio.transforms.Resample(orig_freq=sr, new_freq=target_fs)
         audio_tensor = resampler(audio_tensor)
+    
     audio_tensor = audio_tensor.to(DEVICE)
-    
-    # Chunking
-    chunk_duration = 30
-    chunk_size = chunk_duration * target_fs
-    overlap_size = overlap_duration * target_fs
-    
-    if not full_song_mode:
-        if audio_tensor.shape[1] > chunk_size:
-            audio_tensor = audio_tensor[:, :chunk_size]
-        elif audio_tensor.shape[1] < chunk_size:
-            audio_tensor = torch.nn.functional.pad(audio_tensor, (0, chunk_size - audio_tensor.shape[1]))
-        chunks = [audio_tensor]
-    else:
-        chunks = []
-        start = 0
-        stride = chunk_size - overlap_size
-        while start < audio_tensor.shape[1]:
-            end = min(start + chunk_size, audio_tensor.shape[1])
-            chunk = audio_tensor[:, start:end]
-            if chunk.shape[1] < chunk_size:
-                chunk = torch.nn.functional.pad(chunk, (0, chunk_size - chunk.shape[1]))
-            chunks.append(chunk)
-            start += stride
 
-    print(f"🔄 Processing {len(chunks)} chunk(s)...")
-    
-    # Encode
-    degraded_latents_list = []
+    # Paper Specs: 30s chunks, 10s overlap for conditioning
+    chunk_dur = 30
+    overlap_dur = 10
+    chunk_size = chunk_dur * target_fs
+    overlap_size = overlap_dur * target_fs
+    stride = chunk_size - overlap_size
+
+    chunks = []
+    start = 0
+    while start < audio_tensor.shape[1]:
+        end = min(start + chunk_size, audio_tensor.shape[1])
+        chunk = audio_tensor[:, start:end]
+        if chunk.shape[1] < chunk_size:
+            chunk = torch.nn.functional.pad(chunk, (0, chunk_size - chunk.shape[1]))
+        chunks.append(chunk)
+        start += stride
+
+    # Latent encoding (Batched VAE)
+    degraded_latents = []
     with torch.no_grad():
-        chunk_stack = torch.stack(chunks).to(DEVICE)
-        for b in range(0, len(chunk_stack), 4):
-            batch = chunk_stack[b : b + 4]
-            lat = VAE.encode(batch).latent_dist.mode()
-            degraded_latents_list.append(lat)
-        degraded_latents = torch.cat(degraded_latents_list, dim=0)
+        stack = torch.stack(chunks).to(DEVICE)
+        for b in range(0, len(stack), 4):
+            lat = VAE.encode(stack[b:b+4]).latent_dist.mode()
+            degraded_latents.append(lat)
+        degraded_latents = torch.cat(degraded_latents, dim=0)
 
     decoded_waves = []
-    prev_cond_latent = None
+    prev_out_cue = None # The 10s 'audio pooling' reference from previous output
 
-    # Inference Loop
     for i in range(len(degraded_latents)):
-        torch.manual_seed(seed) # Reset seed for consistency per chunk
-        
-        latent_in = degraded_latents[i].unsqueeze(0).transpose(1, 2)
-        cond = prev_cond_latent if full_song_mode and i > 0 else None
-        
-        with torch.no_grad():
-            result_latent = MODEL.inference_flow(
-                latent_in,
-                prompt,
-                audiocond_latents=cond,
-                num_inference_steps=steps,
-                guidance_scale=guidance_scale,
-                duration=chunk_duration,
-                seed=seed,
-                disable_progress=True,
-                num_samples_per_prompt=1,
-                solver=solver # Pass solver here
-            )
-            decoded = VAE.decode(result_latent.transpose(2, 1)).sample.cpu()
-            decoded_waves.append(decoded)
+        # Paper: "The last 10s of this output are used to condition the next segment"
+        # We re-encode the previous output segment to get the conditioning latent
+        cond_latent = None
+        if i > 0 and prev_out_cue is not None:
+            with torch.no_grad():
+                # Encode last 10s of previous output as the clean reference
+                cond_latent = VAE.encode(prev_out_cue.to(DEVICE)).latent_dist.mode().transpose(1, 2)
+
+        ensemble_accum = None
+        for e in range(ensemble):
+            current_seed = seed + i + (e * 555)
+            torch.manual_seed(current_seed)
             
-            if full_song_mode:
-                last_segment = decoded[:, :, -overlap_size:].to(DEVICE)
-                prev_cond_latent = VAE.encode(last_segment).latent_dist.mode().transpose(1, 2)
+            z_in = degraded_latents[i].unsqueeze(0).transpose(1, 2)
+            
+            with torch.no_grad():
+                res_latent = MODEL.inference_flow(
+                    z_in, prompt,
+                    audiocond_latents=cond_latent,
+                    num_inference_steps=steps,
+                    guidance_scale=cfg,
+                    duration=chunk_dur,
+                    seed=current_seed,
+                    solver=solver
+                )
+                decoded = VAE.decode(res_latent.transpose(2, 1)).sample.cpu()
+                if ensemble_accum is None: ensemble_accum = decoded
+                else: ensemble_accum += decoded
         
+        chunk_out = ensemble_accum / ensemble
+        decoded_waves.append(chunk_out)
+        
+        # Save last 10s for next chunk conditioning (Audio Pooling Branch)
+        prev_out_cue = chunk_out[:, :, -overlap_size:]
         torch.cuda.empty_cache()
 
-    # Stitching
-    if not full_song_mode:
-        final_audio = decoded_waves[0].squeeze(0)
-    else:
-        final_audio = decoded_waves[0]
-        for i in range(1, len(decoded_waves)):
-            prev = final_audio[:, :, -overlap_size:]
-            curr = decoded_waves[i][:, :, :overlap_size]
-            alpha = torch.linspace(1, 0, steps=overlap_size).view(1, 1, -1)
-            beta = 1 - alpha
-            blended = prev * alpha + curr * beta
-            final_audio = torch.cat([
-                final_audio[:, :, :-overlap_size],
-                blended,
-                decoded_waves[i][:, :, overlap_size:]
-            ], dim=2)
-        final_audio = final_audio.squeeze(0)
+    # Stitching (Linear interpolation over 10s as per paper)
+    final_audio = decoded_waves[0]
+    alpha = torch.linspace(1, 0, steps=overlap_size).view(1, 1, -1)
+    beta = 1 - alpha
 
-    # Normalize
-    final_numpy = final_audio.numpy().T
-    if normalize_output:
-        print("🔊 Normalizing...")
-        if final_numpy.ndim > 1:
-            for ch in range(final_numpy.shape[1]):
-                final_numpy[:, ch] = match_target_amplitude(final_numpy[:, ch], original_audio_numpy)
-        else:
-            final_numpy = match_target_amplitude(final_numpy, original_audio_numpy)
-        final_numpy = np.clip(final_numpy, -1.0, 1.0)
+    for i in range(1, len(decoded_waves)):
+        prev_part = final_audio[:, :, -overlap_size:]
+        curr_part = decoded_waves[i][:, :, :overlap_size]
+        blended = prev_part * alpha + curr_part * beta
+        final_audio = torch.cat([final_audio[:, :, :-overlap_size], blended, decoded_waves[i][:, :, overlap_size:]], dim=2)
     
-    output_path = SPACE_ROOT / "output.flac"
-    sf.write(output_path, final_numpy, target_fs)
+    final_np = final_audio.squeeze(0).numpy().T
+    if normalize:
+        for ch in range(final_np.shape[1]):
+            final_np[:, ch] = match_target_amplitude(final_np[:, ch], orig_np)
+        final_np = np.clip(final_np, -1.0, 1.0)
     
-    return output_path.as_posix(), f"Done! Seed: {seed}"
+    out_path = SPACE_ROOT / "sonic_output.wav"
+    sf.write(out_path, final_np, target_fs, subtype='FLOAT')
+    return out_path.as_posix(), f"Success. Seed: {seed}"
 
-# --- UI ---
-css = ".container { max-width: 800px; margin: auto; }"
-with gr.Blocks(title="SonicMaster Colab", theme=gr.themes.Soft(), css=css) as app:
-    gr.Markdown("# 🎛️ SonicMaster: AI Music Restoration")
+# --- UI Construction ---
+with gr.Blocks(title="SonicMaster PRO", theme=gr.themes.Default()) as app:
+    gr.Markdown("# 🎧 SonicMaster: Controllable Music Restoration")
+    gr.Markdown("Based on *'SonicMaster: Towards Controllable All-in-One Music Restoration and Mastering'* (2025).")
     
-    with gr.Group():
-        default_token = os.getenv("HF_TOKEN") or ""
-        hf_token_inp = gr.Textbox(label="Hugging Face Token", value=default_token, type="password")
-        load_btn = gr.Button("🔌 Load Model", variant="primary")
-        load_status = gr.Textbox(label="Status", interactive=False, value="Waiting...")
+    with gr.Row():
+        with gr.Column():
+            token = gr.Textbox(label="HF Token", type="password", value=os.getenv("HF_TOKEN", ""))
+            load_btn = gr.Button("🚀 Step 1: Load Model")
+            status = gr.Textbox(label="Status", interactive=False)
+            
+            in_audio = gr.Audio(label="Step 2: Upload Music", type="numpy")
+            prompt = gr.Textbox(
+                label="Step 3: Instructions (from Paper)", 
+                placeholder="e.g. 'Remove the excess reverb', 'Fix the clipping and harshness'",
+                value="Master this song, remove room echo, improve clarity"
+            )
+            
+            with gr.Accordion("Advanced Paper Settings", open=False):
+                solver = gr.Dropdown(["Euler", "rk4"], value="rk4", label="ODE Solver (rk4 = Paper High Quality)")
+                steps = gr.Slider(1, 100, value=10, step=1, label="Steps (Paper uses 10 for rk4)")
+                cfg = gr.Slider(1.0, 5.0, value=2.0, step=0.1, label="CFG (Keep low for restoration)")
+                ensemble = gr.Slider(1, 4, value=1, step=1, label="Ensemble (Quality Multiplier)")
+                norm = gr.Checkbox(label="Match Input Loudness", value=True)
+                seed = gr.Number(label="Seed (-1 for Random)", value=-1)
 
-    input_audio = gr.Audio(label="Source Audio", type="numpy")
-    prompt = gr.Textbox(label="Prompt", value="Master this track, remove reverb, high fidelity")
-    
-    with gr.Accordion("⚙️ Advanced Settings", open=True):
-        with gr.Row():
-            solver_drop = gr.Dropdown(choices=["Euler", "rk4"], value="Euler", label="Solver (rk4 is slower but cleaner)")
-            full_song_chk = gr.Checkbox(label="Full Song Mode", value=True)
-            normalize_chk = gr.Checkbox(label="Match Input Volume", value=True)
-        steps = gr.Slider(10, 150, value=50, step=1, label="Inference Steps (Default: 50)")
-        cfg = gr.Slider(1.0, 10.0, value=3.0, step=0.1, label="Guidance Scale")
-        seed = gr.Number(label="Seed (-1 = Random)", value=-1, precision=0)
-    
-    run_btn = gr.Button("🚀 Process Audio", variant="primary", interactive=False, size="lg")
-    output_audio = gr.Audio(label="Restored Audio", type="filepath")
-    result_info = gr.Textbox(label="Processing Info", interactive=False)
+            run_btn = gr.Button("✨ Process Entire Track", variant="primary", interactive=False)
 
-    def unlock_ui(status):
-        return gr.update(interactive=True) if "successfully" in status else gr.update(interactive=False)
+        with gr.Column():
+            out_audio = gr.Audio(label="Restored Result (32-bit WAV)")
+            info = gr.Textbox(label="Log")
 
-    load_btn.click(load_models, inputs=[hf_token_inp], outputs=[load_status]).then(
-        unlock_ui, inputs=[load_status], outputs=[run_btn]
-    )
-    
-    run_btn.click(
-        process_audio,
-        inputs=[input_audio, prompt, steps, cfg, seed, solver_drop, full_song_chk, normalize_chk],
-        outputs=[output_audio, result_info]
-    )
+    def unlock(s): return gr.update(interactive="successfully" in s)
+    load_btn.click(load_models, [token], [status]).then(unlock, [status], [run_btn])
+    run_btn.click(process_audio, [in_audio, prompt, steps, cfg, seed, solver, ensemble, norm], [out_audio, info])
 
 if __name__ == "__main__":
     app.launch(server_name="0.0.0.0", server_port=7860)
